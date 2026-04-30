@@ -162,7 +162,7 @@ ExecStartPre=/bin/sleep 1
 ExecStart=$INSTALL_DIR/$BINARY_NAME
 Restart=always
 RestartSec=5
-Environment=PANEL_LISTEN=0.0.0.0:${PORT}
+Environment=PANEL_ADDR=0.0.0.0:${PORT}
 Environment=PANEL_ADMIN_PATH=/admin
 
 [Install]
