@@ -41,9 +41,12 @@ show_menu() {
 
     # 显示当前状态
     if systemctl is-active --quiet "$SERVICE_NAME" 2>/dev/null; then
-        PORT=$(systemctl show "$SERVICE_NAME" -p Environment 2>/dev/null \
-            | grep -o 'PANEL_LISTEN=[^ ]*' | cut -d: -f2 || echo "?")
+        ADDR=$(systemctl show "$SERVICE_NAME" -p Environment 2>/dev/null \
+            | grep -o 'PANEL_ADDR=[^ ]*' | cut -d= -f2)
+        PORT=$(echo "$ADDR" | grep -o '[0-9]*$')
+        [ -z "$PORT" ] && PORT="?"
         SERVER_IP=$(curl -s4 --connect-timeout 3 ifconfig.me 2>/dev/null \
+            || curl -s6 --connect-timeout 3 ifconfig.me 2>/dev/null \
             || hostname -I | awk '{print $1}')
         echo -e "  状态: ${GREEN}运行中${NC}"
         echo -e "  访问: ${GREEN}http://${SERVER_IP}:${PORT}/admin${NC}"
@@ -162,7 +165,7 @@ ExecStartPre=/bin/sleep 1
 ExecStart=$INSTALL_DIR/$BINARY_NAME
 Restart=always
 RestartSec=5
-Environment=PANEL_ADDR=0.0.0.0:${PORT}
+Environment=PANEL_ADDR=[::]:${PORT}
 Environment=PANEL_ADMIN_PATH=/admin
 
 [Install]
