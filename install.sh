@@ -251,6 +251,111 @@ EOF
   log "  - 已写入并设置权限 600 ✅"
 }
 
+read_env_value() {
+  local key="$1"
+  [ -f "$ENV_FILE" ] || return 1
+  grep -E "^${key}=" "$ENV_FILE" 2>/dev/null | tail -1 | cut -d= -f2-
+}
+
+set_env_value() {
+  local key="$1"
+  local value="$2"
+  local tmp
+  tmp="$(mktemp)"
+  if [ -f "$ENV_FILE" ]; then
+    if grep -qE "^${key}=" "$ENV_FILE"; then
+      sed "s|^${key}=.*|${key}=${value}|" "$ENV_FILE" > "$tmp"
+    else
+      cat "$ENV_FILE" > "$tmp"
+      printf '%s=%s\n' "$key" "$value" >> "$tmp"
+    fi
+  else
+    printf '%s=%s\n' "$key" "$value" > "$tmp"
+  fi
+  $SUDO install -m 600 "$tmp" "$ENV_FILE"
+  rm -f "$tmp"
+}
+
+extract_addr_port() {
+  local addr="$1"
+  if echo "$addr" | grep -qE '^\[[^]]+\]:[0-9]+$'; then
+    echo "$addr" | sed -E 's/^.*:([0-9]+)$/\1/'
+  elif echo "$addr" | grep -qE '^[^:]+:[0-9]+$'; then
+    echo "${addr##*:}"
+  else
+    echo "$PANEL_PORT"
+  fi
+}
+
+server_ipv4() {
+  local ip
+  ip="$(hostname -I 2>/dev/null | tr ' ' '\n' | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | grep -Ev '^(127|169\.254)\.' | head -1)"
+  [ -z "$ip" ] && ip="$(hostname -i 2>/dev/null | tr ' ' '\n' | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | grep -Ev '^(127|169\.254)\.' | head -1)"
+  [ -z "$ip" ] && ip="<服务器IP>"
+  echo "$ip"
+}
+
+open_firewall_port() {
+  local port="$1"
+  if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -qi "Status: active"; then
+    $SUDO ufw allow "${port}/tcp" >/dev/null 2>&1 || true
+    log "  - ufw 已放行 ${port}/tcp"
+    return
+  fi
+  if command -v firewall-cmd >/dev/null 2>&1 && $SUDO firewall-cmd --state >/dev/null 2>&1; then
+    $SUDO firewall-cmd --permanent --add-port="${port}/tcp" >/dev/null 2>&1 || true
+    $SUDO firewall-cmd --reload >/dev/null 2>&1 || true
+    log "  - firewalld 已放行 ${port}/tcp"
+    return
+  fi
+  warn "未检测到已启用的 ufw/firewalld；如云服务器仍无法访问，请在安全组放行 TCP ${port}"
+}
+
+configure_ip_port_mode() {
+  step "配置 IP+端口直连访问模式 ..."
+  if [ ! -x "$BIN_PATH" ] || [ ! -f "$SERVICE_FILE" ]; then
+    warn "尚未安装服务，请先执行一键安装后再开启 IP+端口模式。"
+    return
+  fi
+
+  [ -f "$ENV_FILE" ] || init_env_file
+
+  local current_addr current_port input port ip
+  current_addr="$(read_env_value PANEL_ADDR || true)"
+  current_port="$(extract_addr_port "$current_addr")"
+  [ -z "$current_port" ] && current_port="$PANEL_PORT"
+
+  read -r -p "请输入面板端口 [${current_port}]: " input
+  port="${input:-$current_port}"
+  case "$port" in
+    ''|*[!0-9]*)
+      warn "端口无效：$port"
+      return
+      ;;
+  esac
+  if [ "$port" -lt 1 ] || [ "$port" -gt 65535 ]; then
+    warn "端口范围必须是 1-65535"
+    return
+  fi
+
+  set_env_value PANEL_ADDR "0.0.0.0:${port}"
+  set_env_value PANEL_ALLOW_INSECURE_PUBLIC_BIND "1"
+  set_env_value PANEL_COOKIE_SECURE "0"
+  PANEL_PORT="$port"
+
+  open_firewall_port "$port"
+  write_systemd_service
+  start_service
+
+  ip="$(server_ipv4)"
+  echo
+  log "IP+端口模式已启用："
+  echo -e "    面板地址 : ${CYAN}http://${ip}:${port}${PANEL_ADMIN_PATH}${NC}"
+  echo -e "    监听配置 : ${CYAN}PANEL_ADDR=0.0.0.0:${port}${NC}"
+  echo -e "    HTTP登录 : ${CYAN}PANEL_COOKIE_SECURE=0${NC}"
+  echo -e "    配置文件 : ${ENV_FILE}"
+}
+
 # ---------------- 写入 systemd 服务 ----------------
 write_systemd_service() {
   step "写入 systemd 服务 $SERVICE_FILE ..."
@@ -342,6 +447,13 @@ print_banner() {
   else
     echo -e "    本机面板 : ${CYAN}http://127.0.0.1:${PANEL_PORT}${PANEL_ADMIN_PATH}${NC}"
   fi
+  local bind_addr bind_port public_ip
+  bind_addr="$(read_env_value PANEL_ADDR || true)"
+  bind_port="$(extract_addr_port "$bind_addr")"
+  public_ip="$(server_ipv4)"
+  if echo "$bind_addr" | grep -Eq '^(0\.0\.0\.0|\[::\]):'; then
+    echo -e "    IP+端口 : ${CYAN}http://${public_ip}:${bind_port}${PANEL_ADMIN_PATH}${NC}"
+  fi
   echo -e "    若已配置反代/公网: ${CYAN}https://<你的域名>${PANEL_ADMIN_PATH}${NC}"
   echo -e "  ${BOLD}文件位置${NC}"
   echo -e "    二进制   : ${BIN_PATH}"
@@ -364,6 +476,7 @@ print_banner() {
   echo -e "    systemctl start|stop|restart|status ${SERVICE_NAME}"
   echo -e "    journalctl -u ${SERVICE_NAME} -f                # 实时日志"
   echo -e "    bash $0 menu                                    # 交互菜单"
+  echo -e "    bash $0 ip-port                                 # 开启/修改 IP+端口访问"
   echo -e "    bash $0 update                                  # 升级到最新版"
   echo -e "    bash $0 uninstall                               # 卸载"
   echo -e "${GREEN}============================================${NC}"
@@ -421,6 +534,10 @@ do_uninstall() {
 }
 
 do_status() {
+  local addr status_port public_ip
+  addr="$(read_env_value PANEL_ADDR || true)"
+  status_port="$(extract_addr_port "$addr")"
+  public_ip="$(server_ipv4)"
   echo "============================================"
   echo "  mpd2hls 服务状态"
   echo "============================================"
@@ -429,7 +546,11 @@ do_status() {
   else
     echo -e "  状态  : ${RED}未运行${NC}"
   fi
-  echo "  端口  : $PANEL_PORT"
+  echo "  端口  : ${status_port:-$PANEL_PORT}"
+  echo "  监听  : ${addr:-未生成配置}"
+  if echo "$addr" | grep -Eq '^(0\.0\.0\.0|\[::\]):'; then
+    echo "  IP访问: http://${public_ip}:${status_port}${PANEL_ADMIN_PATH}"
+  fi
   echo "  目录  : $INSTALL_DIR"
   echo "  二进制: $BIN_PATH ($([ -f "$BIN_PATH" ] && du -h "$BIN_PATH" | cut -f1 || echo '未安装'))"
   echo "  配置  : $ENV_FILE"
@@ -484,8 +605,9 @@ show_menu() {
   echo -e "  ${GREEN}5)${NC}  停止服务"
   echo -e "  ${GREEN}6)${NC}  查看运行状态"
   echo -e "  ${GREEN}7)${NC}  查看实时日志"
-  echo -e "  ${GREEN}8)${NC}  查看首次启动随机密码"
-  echo -e "  ${RED}9)${NC}  卸载 (清理所有文件)"
+  echo -e "  ${GREEN}8)${NC}  开启/修改 IP+端口访问模式"
+  echo -e "  ${GREEN}9)${NC}  查看首次启动随机密码"
+  echo -e "  ${RED}10)${NC} 卸载 (清理所有文件)"
   echo -e "  ${YELLOW}0)${NC}  退出"
   echo -e "${BLUE}============================================${NC}"
 }
@@ -493,7 +615,7 @@ show_menu() {
 menu_loop() {
   while true; do
     show_menu
-    read -r -p "请选择 [0-9]: " choice
+    read -r -p "请选择 [0-10]: " choice
     case "$choice" in
       1) do_install auto;  read -r -p "按回车返回菜单..." _ ;;
       2)
@@ -511,8 +633,9 @@ menu_loop() {
       5) stop_service;    read -r -p "按回车返回菜单..." _ ;;
       6) do_status;       read -r -p "按回车返回菜单..." _ ;;
       7) do_logs ;;
-      8) do_show_password; read -r -p "按回车返回菜单..." _ ;;
-      9) do_uninstall;    read -r -p "按回车返回菜单..." _ ;;
+      8) configure_ip_port_mode; read -r -p "按回车返回菜单..." _ ;;
+      9) do_show_password; read -r -p "按回车返回菜单..." _ ;;
+      10) do_uninstall;    read -r -p "按回车返回菜单..." _ ;;
       0) echo "Bye 👋"; exit 0 ;;
       *) warn "无效选择: $choice"; sleep 1 ;;
     esac
@@ -525,6 +648,7 @@ case "${1:-}" in
   install-amd64)      do_install amd64 ;;
   install-arm64)      do_install arm64 ;;
   install-armv7)      do_install armv7 ;;
+  ip-port|ipport|public-bind) configure_ip_port_mode ;;
   update)             do_update ;;
   start)              start_service ;;
   stop)               stop_service ;;
@@ -541,6 +665,7 @@ mpd2hls 一键安装脚本
 用法:
   bash $0                  # 交互菜单 (默认)
   bash $0 install [arch]   # 安装 (arch: auto|amd64|arm64|armv7)
+  bash $0 ip-port          # 开启/修改 IP+端口直连访问模式
   bash $0 update           # 更新到最新版
   bash $0 start|stop       # 启停服务
   bash $0 restart          # 重启服务
@@ -559,6 +684,7 @@ mpd2hls 一键安装脚本
 示例：
   GH_RELEASE_TAG=0.2.33 bash $0 install
   PANEL_PORT=18080 bash $0 install amd64
+  bash $0 ip-port
 EOF
     ;;
   *) error "未知命令: $1   (使用 'bash $0 help' 查看帮助)" ;;
